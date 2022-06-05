@@ -1,0 +1,421 @@
+---
+title: "systERS Simulations in Reinhold et al. (Submitted to _WRR_)"
+author: "Ann Marie Reinhold"
+date: '2022-06-05'
+output: html_document
+---
+
+This document demonstrates how to run the 75 simulations that compose the numerical experiments in the manuscript entitled "Stream corridors as biogeochemical reactors: A Damköhler perspective on environmental solute transport and processing", authored by Ann Marie Reinhold, Stephanie A. Ewing, Robert A. Payn, Geoffrey C. Poole, and H. Maurice Valett. This manuscript has been submitted to _Water Resources Research_. Upon acceptance, this document and the `systERS` R package used herein will be permanently archived on Hydroshare.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Install required packages
+
+Install the System for Environmental Reactor Simulation (`systERS`) package from github and load it. The `hydrogeom` and `plyr` packages are also required. `devtools` is needed to utilize code in following chunk, as both the `systERS` and `hydrogeom` packages are available on github (not CRAN).
+
+```{r reqdPkgs}
+# Install systERS by uncommenting line below and running it.
+# devtools::install("ReinholdLab/systERS")
+
+# Install hydrogeom package, a systERS import, by uncommenting subsequent
+# line and running it. 
+# devtools::install_github("FluvialLandscapeLab/hydrogeom")
+
+# Install plyr package by uncommenting line below and running it.
+# install.packages("plyr")
+
+# Load R package
+library(systERS)
+```
+
+## Set up directory for model runs and output
+
+Supply a main directory called `mainDir` for storing results. If you do not create this directory, model results will be stored in your current working directory. If the output directory already exists, a warning is issued.
+
+```{r createDir}
+mainDir <- ifelse(is.null(mainDir), getwd(), mainDir)
+subDir <- "numExptsOut"
+outDir <- file.path(mainDir, subDir)
+dir.create(outDir)
+```
+
+## Specify model parameters
+
+We first define parameters that are used for all simulations in the manuscript. All hydrophysical and kinetic parameter values are described in detail in *Subsection 3.1 Numerical experiments* of Reinhold et al. (Submitted to *WRR*).
+
+```{r ssParams}
+ssParams <- 
+  data.frame(
+    # Reach dimensions and hydrology
+    reachLen = 250, # m
+    reachDepth = 0.3, # m
+    reachWidth = 0.7, # m
+    disch = 0.069, # m3 s-1
+    
+    # Inflow solute concentration
+    concNO3 = 19.3, # g NO3-N m-3
+    
+    # Reactive-storage parameters
+    k = 0.05 / 3600, # first order rxn rate constant in units of s-1 (k_{r,S} in Table 1 of the paper)
+    tauMin = 10, # s
+    tauMax = 60*60*24*365, # units are s; here, we set to 365 days 
+    tRxn = 0 # units are s; set to 0, i.e., no delay between when water is stored and reactions begin
+  )
+# Calculated parameters (from those above)
+ssParams$channelVol <- ssParams$reachLen * ssParams$reachWidth * ssParams$reachDepth # m3
+ssParams$loadNO3 <- ssParams$disch * ssParams$concNO3 # g NO3-N s-1
+
+# Iteration parameters
+iterParams <- 
+  data.frame(
+    timeStep = 20, # s
+    nIter = 600, # number of iterations for spin up
+    writeInt = 50 # interval for outputting model results (change to 1 to write all time steps)
+  )
+```
+
+## Specify cells, boundaries, and model constants
+
+Create a series of data frames which are used to specify the model cells and boundaries.
+
+```{r initDfs}
+simInput <- list(
+  
+  # Water cell data frame
+  cells_water_stream = 
+    data.frame(
+      currency = "H2O", # name of currency
+      processDomain = "stream", # name of process domain
+      cellIdx = "strm_H2O_001", # name of cell
+      channelWidth = ssParams$reachWidth, # m
+      channelLength = ssParams$reachLen, # m
+      channelDepth = ssParams$reachDepth # m
+    ),
+  
+  # Solute cell data frame
+  cells_solute_stream =
+    data.frame(
+      currency = "NO3", # name of currency
+      processDomain = "stream", # name of process domain
+      cellIdx = "strm_NO3_001", # name of cell
+      concentration = ssParams$concNO3, 
+      linkedCell = "strm_H2O_001" # name of water cell to which the nitrate cell is linked
+    ),
+  
+  # Upstream and downstream external water boundary data frame
+  bounds_transport_water_ext =
+    data.frame(
+      currency = c("H2O", "H2O"), # currency names for each boundary
+      boundaryIdx = c("trans_H2O_001", "trans_H2O_002"), # names for each boundary
+      locationOfBoundInNetwork = c("upstream", "downstream"), # locations of each boundary 
+      cellIdx = c("strm_H2O_001", "strm_H2O_001"), # cells to which boundaries are attached
+      discharge = rep(ssParams$disch, 2), # discharge of each boundary
+      processDomain = c("stream", "stream") # process domain of each boundary
+    ),
+  
+  # Upstream, external solute boundary data frame
+  bounds_transport_solute_us =
+    data.frame(
+      currency = "NO3", # currency name
+      # boundarySuperClass = "transport", # boundary super class type
+      boundaryIdx = "trans_NO3_001", # name of boundary
+      concentration = ssParams$concNO3, # concentration of water passing through boundary
+      load = ssParams$loadNO3, # solute load passing through boundary
+      linkedBound = "trans_H2O_001", # water boundary to which solute boundary is linked
+      upstreamCellIdx = NA, # by definition, there is no upstream cell for this external model boundary
+      downstreamCellIdx = "strm_NO3_001" # name of downstream cell to which boundary is connected
+    ),
+  
+  # Downstream, external solute boundary data frame
+  bounds_transport_solute_ds =
+    data.frame(
+      currency = "NO3", # currency name
+      # boundarySuperClass = "transport", # boundary super class type
+      boundaryIdx = "trans_NO3_002", # name of boundary
+      concentration = ssParams$concNO3, # initial concentration of water passing through boundary
+      load = ssParams$loadNO3, # initial solute load passing through boundary
+      linkedBound = "trans_H2O_002", # water boundary to which solute boundary is linked
+      upstreamCellIdx = "strm_NO3_001", # name of upstream cell to which boundary is connected
+      downstreamCellIdx = NA # by definition, there is no downstream cell for this external model boundary
+    ),
+  
+  # Solute reaction boundaries
+  bounds_react_solute_int = 
+    data.frame(
+      currency = "NO3", # currency name
+      boundaryIdx = "rxn_NO3_001", # boundary name
+      upstreamCellIdx = "strm_NO3_001", # solute cell to which boundary is connected
+      tauMin = ssParams$tauMin, # minimum transit time in which water is considered "stored"
+      tauMax = ssParams$tauMax, # maximum transit time for stored water
+      tauRxn = ssParams$tRxn, # delay after which solute processing begins in reactive storage; 0 in all simulations herein
+      processMethodName = "RT-PL" # name of solute processing method
+    )
+)
+
+```
+
+## Numerical experiment parameters
+
+Define the parameters for the numerical experiments. These are the parameters in Table 3 of Reinhold et al. (Submitted to *WRR*). Note that we use `k` here for what we call $k_{r,S}$ in the paper.
+
+```{r numExptParams}
+
+# A vector of alphas describing the shape parameters of the power-law transit
+# time distribution
+alphaVectBase <-
+  c(
+    alpha1.2 = 1.2,
+    alpha1.4 = 1.4,
+    alpha1.6 = 1.6
+  )
+
+# A vector that contains the volume of water in storage, each defined as a multiplier
+# of the channel volume 
+aqWaterVolVectBase <- 
+  c(
+    aqSz10. = (ssParams$channelVol * 10.0), 
+    aqSz5.0 = (ssParams$channelVol * 5.0),
+    aqSz1.0 = (ssParams$channelVol),
+    aqSz0.2 = (ssParams$channelVol * 0.2),
+    aqSz0.1 = (ssParams$channelVol * 0.1)
+  )
+
+# A vector of first-order reaction-rate constants for solute processing in
+# reactive storage (k_{r,S} in the paper), identified by their multiplication
+# factor
+kBase <- 
+  c(
+    k10. = (ssParams$k * 10.0),
+    k5.0 = (ssParams$k * 5.0),
+    k1.0 = (ssParams$k),
+    k0.2 = (ssParams$k * 0.2),
+    k0.1 = (ssParams$k * 0.1)
+  )
+
+# Full set of parameters in the sensitivity analysis
+paramsToVary <- 
+  expand.grid(
+    alpha = alphaVectBase, 
+    volWaterInStorage = aqWaterVolVectBase, 
+    k = kBase
+  )
+# Names of parameters
+namesOfParamsToVary <-
+  expand.grid(
+    alphaVectBase = names(alphaVectBase), 
+    aqWaterVolVectBase = names(aqWaterVolVectBase), 
+    kBase = names(kBase)
+  )
+# Make row names
+namesOfParamsToVary <- 
+  apply(namesOfParamsToVary, 1, paste, collapse = "_")
+# Assign informative row names
+row.names(paramsToVary) <- namesOfParamsToVary
+
+# Clean up environment
+rm(alphaVectBase, aqWaterVolVectBase, kBase, namesOfParamsToVary)
+
+# Print the parameters that will vary
+knitr::kable(paramsToVary)
+
+```
+
+## Instantiate, iterate, and output systERS models
+
+Instantiate and iterate the models, providing the model inputs for `alpha, volWaterInStorage, k` as appropriate, and write model results. The code below creates a directory for each model, named for the parameters varied in the numerical experiments (row names in table above). Within each model output folder is a series of ascii delimited files (csv extension), the model environment after spin up (RData extension), and some plots of key model values during spin up (pdf extension). Note that the text files store all of the model outputs during spin up at the interval specified in the `iterParams` data frame. In our paper, we used the output values only after the models were spun up and reached a stable steady state approximation. Using the values in `iterParams`, the last row in each output file is that steady-state approximation.
+
+Note that this next chunk takes a few minutes to run on a commercial laptop or desktop because it instantiates, iterates, and writes the output for the 75 different models composing the numerical experiments.
+
+```{r instantiateIterate, echo = TRUE, results = 'hide', warning = FALSE}
+
+lapply(
+  1:nrow(paramsToVary), 
+  function(i){
+    
+    paramSet <- paramsToVary[i,]
+    paramSetName <- row.names(paramSet)
+    
+    # Overwrite model inputs for alpha, volWaterInStorage, k
+    simInput$bounds_react_solute_int$alpha <- paramSet$alpha
+    simInput$bounds_react_solute_int$volWaterInStorage <- paramSet$volWaterInStorage
+    simInput$bounds_react_solute_int$k <- paramSet$k
+    
+    
+    # Instantiate systERS model
+    systERS_mod <-
+      systERSModel$new(
+        # Only one internal cell for each water and nitrate, so no internal
+        # boundaries (set to NULL)
+        boundsTransportTable_water_int = NULL,
+        boundsTransportTable_solute_int = NULL,
+        
+        # Specify external water boundaries
+        boundsTransportTable_water_ext = simInput$bounds_transport_water_ext,
+        
+        # Specify solute boundaries
+        boundsTransportTable_solute_us = simInput$bounds_transport_solute_us,
+        boundsTransportTable_solute_ds =  simInput$bounds_transport_solute_ds,
+        boundsReactionTable_solute_int = simInput$bounds_react_solute_int,
+        
+        # Specify water and solute cells
+        cellsTable_water_stream = simInput$cells_water_stream,
+        cellsTable_solute_stream = simInput$cells_solute_stream,
+        
+        # Time step
+        timeInterval = iterParams$timeStep
+      )
+    
+    
+    # Instantiate the outputters. This code is set up to output far more than
+    # the average user will want or find interesting. However, we include these
+    # outputs here as a matter of convenience for the interested end user (or
+    # manuscript reviewer).  The results in our paper are the values after each
+    # model reached a steady state approximation.
+    outDir <- file.path(outDir, paramSetName)
+    dir.create(outDir)
+    
+    waterTransBoundaryOut <- 
+      Outputter$new(
+        model = systERS_mod,
+        objectClassName = "Boundary_Transport_Water_Stream",
+        attributesToReport = c(
+          "discharge", # Q in m3 s-1
+          "channelVelocity"), # mean velocity in m s-1
+        reportingInterval = iterParams$writeInt, 
+        filePath = outDir
+      )
+    waterCellOut <- 
+      Outputter$new(
+        model = systERS_mod,
+        objectClassName = "Cell_Water_Stream",
+        attributesToReport = c(
+          "waterVolume", # m3, volume of water in cell
+          "channelResidenceTime",  # s, mean residence time of water in channel
+          "hydraulicLoad"), # m s-1, i.e., Q/A
+        reportingInterval = iterParams$writeInt,
+        filePath = outDir
+      )
+    soluteTransBoundaryOut <- 
+      Outputter$new(
+        model = systERS_mod,
+        objectClassName = "Boundary_Transport_Solute",
+        attributesToReport = c(
+          "currency", # currency name
+          "amount", # g, mass solute passing through boundary for currency specified
+          "load"), # g s-1, load solute passing through boundary for currency specified
+        reportingInterval = iterParams$writeInt,
+        filePath = outDir
+      )
+    soluteCellOut <-
+      Outputter$new(
+        model = systERS_mod,
+        objectClassName = "Cell_Solute",
+        attributesToReport = c(
+          "currency", # currency name
+          "amount", # g, mass solute in cell
+          "concentration"), # g m-3 in cell
+        reportingInterval = iterParams$writeInt,
+        filePath = outDir
+      )
+    soluteRxnBoundaryOut <-
+      Outputter$new(
+        model = systERS_mod,
+        objectClassName = "Boundary_Reaction_Solute_Stream",
+        attributesToReport = c(
+          "currency", # currency name
+          "k", # first order reaction rate constant in storage (k_{r,S} in our manuscript)
+          "alpha", # power law exponent for flow paths through reactive storage (hyporheic zone)
+          "tauMin", # minimum storage time
+          "tauMax", # maximum storage time
+          "startingAmount", # mass solute in channel at start of time step
+          "amountToRemove", # mass solute in reach reactor removed by reactive storage
+          "amountToRemain", # mass solute in reach reactor not removed by reactive storage
+          "damkohlerNum", # Damkohler number for whole-reach reactor
+          "damkohlerNumStorage", # Damkohler number for reactive storage
+          "fractionRemaining", # fraction of solute in reactor remaining at end of time step
+          "fractionRemoved", # fraction of solute in reactor removed over time step
+          "fractionRemainingStorage", # fraction of solute in reactive storage remaining at end of time step
+          "fractionRemovedStorage", # fraction of solute in reactive storage removed over time step
+          "qStorage", # 1-D flux of water from the channel in to the hyporheic zone (function of size of storage zone and power-law exponent governing the distribution of flow paths through storage)
+          "volWaterInStorage" # volume of water in hyporheic zone
+        ),
+        reportingInterval = iterParams$writeInt,
+        filePath = outDir
+      )
+    # The outputterList is the list of outputs to write to file.  
+    outputterList <- 
+      list(
+        waterCellOut, 
+        waterTransBoundaryOut, 
+        soluteCellOut, 
+        soluteTransBoundaryOut, 
+        soluteRxnBoundaryOut
+      )
+    
+    # Output key variables during spin up for subsequent plotting only
+    soluteRxnBoundaryToPlot <-
+      Outputter$new(
+        model = systERS_mod,
+        objectClassName = "Boundary_Reaction_Solute_Stream",
+        attributesToReport = c(
+          "amountToRemove", # mass solute in reactor removed by boundary
+          "amountToRemain" # mass solute in reactor not removed by boundary
+        ),
+        reportingInterval = iterParams$writeInt,
+        filePath = outDir
+      )
+    soluteCellToPlot <-
+      Outputter$new(
+        model = systERS_mod,
+        objectClassName = "Cell_Solute",
+        attributesToReport = "concentration", # concentration in the cell
+        reportingInterval = iterParams$writeInt,
+        filePath = outDir
+      )
+    
+    ### Iterate the model and store outputs
+    nTimesteps <- iterParams$nIter # set number of time steps
+    
+    lapply(
+      1:nTimesteps, 
+      function(i){
+        systERS_mod$iterate() # iterate model
+        lapply(outputterList, function(out) out$report()) # create outputs
+      }
+    )
+    # Store model environment
+    save(systERS_mod, file = paste0(outDir, "/systERS_mod.RData"))
+    
+    # Create plots of outputs to visualize model spin up to steady state and
+    # save them as pdfs.
+    lapply(
+      list(soluteRxnBoundaryToPlot, soluteCellToPlot), function(output){
+        
+        numOfPlots <- length(output$objectsToReport)
+        numOfCols <- ifelse(numOfPlots > 4, 4, numOfPlots)
+        numOfRows <- ifelse(numOfPlots > 4, ceiling(numOfPlots/4), 1)
+        
+        pdf(
+          paste0(outDir, "/", output$objectClassName,"_plots.pdf"), 
+          width =5, 
+          height = 6, 
+          useDingbats = FALSE
+        )
+        par(mfrow = c(numOfRows, numOfCols))
+        Map(
+          function(attr, obj, dest){
+            output$timeSeriesGraph(obj, attr, dest)
+          },
+          rep(output$attributesToReport, each = length(output$objectsToReport)),
+          output$objectsToReport,
+          output$destination
+        ) # close Map
+        dev.off()
+      } # close plotting func
+    ) # close plotting lapply
+    
+  } # close instantiate, iterate, write func
+) # close instantiate, iterate, write lapply
+```
